@@ -1,7 +1,8 @@
 import os
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Enum, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -10,7 +11,6 @@ from typing import List, Optional
 from pydantic import BaseModel, EmailStr
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import enum
 
 # Database URL - YOUR EXACT DATABASE
@@ -139,13 +139,13 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
     token = credentials.credentials
     payload = decode_token(token)
     if payload is None:
-        raise HTTPException(status_code=401, detail="Token invalide")
+        raise HTTPException(status_code=401, detail="Token invalide ou expiré")
     return payload
 
 def role_required(allowed_roles):
     async def role_checker(current_user = Depends(get_current_user)):
         if current_user.get("role") not in allowed_roles:
-            raise HTTPException(status_code=403, detail="Permission insuffisante")
+            raise HTTPException(status_code=403, detail=f"Permission insuffisante. Rôle requis: {allowed_roles}")
         return current_user
     return role_checker
 
@@ -201,28 +201,83 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
     db_user = User(nom=user.nom, email=user.email, mot_de_passe=hashed, role_id=user.role)
     db.add(db_user)
     db.commit()
-    return {"message": "Utilisateur créé", "user_id": db_user.id}
+    db.refresh(db_user)
+    return {"message": "Utilisateur créé avec succès", "user_id": db_user.id, "role": db_user.role_id}
 
 @app.post("/api/auth/login")
-async def login(login: UserLogin, db: Session = Depends(get_db)):
+async def login(login: UserLogin, request: Request, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == login.email).first()
     if not user or not verify_password(login.mot_de_passe, user.mot_de_passe):
         raise HTTPException(status_code=401, detail="Email ou mot de passe incorrect")
     
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="Compte désactivé")
+    
     token = create_access_token({"sub": user.email, "user_id": user.id, "role": user.role_id})
-    return {"access_token": token, "token_type": "bearer", "role": user.role_id}
+    
+    # Log login
+    log = AuditLog(user_id=user.id, action="LOGIN", details="Connexion réussie", ip_address=request.client.host)
+    db.add(log)
+    db.commit()
+    
+    return {"access_token": token, "token_type": "bearer", "role": user.role_id, "user_id": user.id, "nom": user.nom}
 
+# Dashboard endpoints
 @app.get("/api/dashboard/dg")
 async def dashboard_dg(current_user = Depends(role_required([RoleEnum.DG, RoleEnum.DAF])), db: Session = Depends(get_db)):
     entrees = db.query(Transaction).filter(Transaction.type == "entrée", Transaction.statut == TransactionStatus.APPROUVE).all()
     sorties = db.query(Transaction).filter(Transaction.type == "sortie", Transaction.statut == TransactionStatus.APPROUVE).all()
     
+    total_entrees = sum(t.montant for t in entrees)
+    total_sorties = sum(t.montant for t in sorties)
+    montant_disponible = total_entrees - total_sorties
+    
+    # Stock quantities
+    stocks = db.query(Stock).all()
+    quantite_entree = sum(s.quantite_entree for s in stocks)
+    quantite_sortie = sum(s.quantite_sortie for s in stocks)
+    quantite_disponible = sum(s.quantite_disponible for s in stocks)
+    
+    en_attente = db.query(Transaction).filter(Transaction.statut == TransactionStatus.EN_ATTENTE).count()
+    
     return {
-        "total_entrees": sum(t.montant for t in entrees),
-        "total_sorties": sum(t.montant for t in sorties),
-        "montant_disponible": sum(t.montant for t in entrees) - sum(t.montant for t in sorties)
+        "total_entrees": total_entrees,
+        "total_sorties": total_sorties,
+        "montant_disponible": montant_disponible,
+        "quantite_entree": quantite_entree,
+        "quantite_sortie": quantite_sortie,
+        "quantite_disponible": quantite_disponible,
+        "validations_en_attente": en_attente
     }
 
+@app.get("/api/dashboard/commercial")
+async def dashboard_commercial(current_user = Depends(role_required([RoleEnum.DIRECTEUR_COMMERCIAL])), db: Session = Depends(get_db)):
+    ventes = db.query(Vente).all()
+    quantite_vendue = sum(v.quantite for v in ventes)
+    
+    stocks = db.query(Stock).all()
+    quantite_disponible = sum(s.quantite_disponible for s in stocks)
+    
+    # Performance par agent
+    agents = db.query(User).filter(User.role_id == RoleEnum.AGENT_MARKETING).all()
+    performance = []
+    for agent in agents:
+        ventes_agent = db.query(Vente).filter(Vente.agent_id == agent.id).all()
+        if ventes_agent:
+            performance.append({
+                "agent": agent.nom,
+                "ventes": len(ventes_agent),
+                "quantite": sum(v.quantite for v in ventes_agent),
+                "montant": sum(v.quantite * v.prix_unitaire for v in ventes_agent)
+            })
+    
+    return {
+        "quantite_vendue": quantite_vendue,
+        "quantite_disponible": quantite_disponible,
+        "performance_agents": performance
+    }
+
+# Transaction endpoints
 @app.post("/api/transactions")
 async def create_transaction(transaction: TransactionCreate, current_user = Depends(role_required([RoleEnum.COMPTABLE])), db: Session = Depends(get_db)):
     db_transaction = Transaction(
@@ -233,12 +288,21 @@ async def create_transaction(transaction: TransactionCreate, current_user = Depe
     )
     db.add(db_transaction)
     db.commit()
-    return {"message": "Transaction créée", "id": db_transaction.id}
+    db.refresh(db_transaction)
+    
+    return {
+        "message": "Transaction enregistrée",
+        "transaction_id": db_transaction.id,
+        "statut": "EN_ATTENTE" if transaction.type == "sortie" else "APPROUVE"
+    }
 
 @app.get("/api/transactions/pending")
-async def get_pending(current_user = Depends(role_required([RoleEnum.DG, RoleEnum.DAF])), db: Session = Depends(get_db)):
-    pending = db.query(Transaction).filter(Transaction.statut == TransactionStatus.EN_ATTENTE).all()
-    return pending
+async def get_pending_transactions(current_user = Depends(role_required([RoleEnum.DG, RoleEnum.DAF])), db: Session = Depends(get_db)):
+    pending = db.query(Transaction).filter(Transaction.statut == TransactionStatus.EN_ATTENTE).order_by(Transaction.date.desc()).all()
+    return [
+        {"id": t.id, "type": t.type, "montant": t.montant, "libelle": t.libelle, "date": t.date.isoformat() if t.date else None}
+        for t in pending
+    ]
 
 @app.post("/api/transactions/approve")
 async def approve_transaction(approve: TransactionApprove, current_user = Depends(role_required([RoleEnum.DG, RoleEnum.DAF])), db: Session = Depends(get_db)):
@@ -246,40 +310,132 @@ async def approve_transaction(approve: TransactionApprove, current_user = Depend
     if not transaction:
         raise HTTPException(status_code=404, detail="Transaction non trouvée")
     
-    transaction.statut = TransactionStatus.APPROUVE if approve.approuver else TransactionStatus.REJETE
-    transaction.valide_par = current_user.get("user_id")
+    if approve.approuver:
+        transaction.statut = TransactionStatus.APPROUVE
+        transaction.valide_par = current_user.get("user_id")
+        message = "Transaction approuvée avec succès"
+    else:
+        transaction.statut = TransactionStatus.REJETE
+        message = "Transaction rejetée"
+    
     db.commit()
-    return {"message": "Transaction approuvée" if approve.approuver else "Transaction rejetée"}
+    return {"message": message, "transaction_id": transaction.id, "statut": transaction.statut}
 
+@app.get("/api/transactions/history")
+async def get_transactions_history(current_user = Depends(role_required([RoleEnum.DG, RoleEnum.DAF, RoleEnum.COMPTABLE])), db: Session = Depends(get_db), limit: int = 100):
+    transactions = db.query(Transaction).order_by(Transaction.date.desc()).limit(limit).all()
+    return [
+        {"id": t.id, "type": t.type, "montant": t.montant, "libelle": t.libelle, "statut": t.statut, "date": t.date.isoformat() if t.date else None}
+        for t in transactions
+    ]
+
+# Vente endpoints
 @app.post("/api/ventes")
 async def create_vente(vente: VenteCreate, current_user = Depends(role_required([RoleEnum.AGENT_MARKETING])), db: Session = Depends(get_db)):
+    user_id = current_user.get("user_id")
+    
     db_vente = Vente(
         produit=vente.produit,
         quantite=vente.quantite,
         prix_unitaire=vente.prix_unitaire,
-        agent_id=current_user.get("user_id")
+        agent_id=user_id
     )
     db.add(db_vente)
+    
+    # Update stock
+    stock = db.query(Stock).filter(Stock.produit == vente.produit).first()
+    if stock:
+        stock.quantite_sortie += vente.quantite
+        stock.quantite_disponible = stock.quantite_entree - stock.quantite_sortie
+    else:
+        stock = Stock(produit=vente.produit, quantite_sortie=vente.quantite, quantite_disponible=-vente.quantite)
+        db.add(stock)
+    
     db.commit()
-    return {"message": "Vente enregistrée", "quantite": vente.quantite, "prix_unitaire": vente.prix_unitaire}
+    
+    return {"message": "Vente enregistrée avec succès", "produit": vente.produit, "quantite": vente.quantite, "prix_unitaire": vente.prix_unitaire}
 
 @app.get("/api/ventes/my")
 async def get_my_ventes(current_user = Depends(role_required([RoleEnum.AGENT_MARKETING])), db: Session = Depends(get_db)):
-    ventes = db.query(Vente).filter(Vente.agent_id == current_user.get("user_id")).all()
-    return ventes
+    user_id = current_user.get("user_id")
+    ventes = db.query(Vente).filter(Vente.agent_id == user_id).order_by(Vente.date.desc()).all()
+    return [
+        {"id": v.id, "produit": v.produit, "quantite": v.quantite, "prix_unitaire": v.prix_unitaire, "date": v.date.isoformat() if v.date else None}
+        for v in ventes
+    ]
 
+@app.get("/api/ventes/commercial")
+async def get_all_ventes_commercial(current_user = Depends(role_required([RoleEnum.DIRECTEUR_COMMERCIAL])), db: Session = Depends(get_db)):
+    ventes = db.query(Vente).order_by(Vente.date.desc()).all()
+    return [
+        {"id": v.id, "produit": v.produit, "quantite": v.quantite, "prix_unitaire": v.prix_unitaire, "montant_total": v.quantite * v.prix_unitaire, "agent_id": v.agent_id, "date": v.date.isoformat() if v.date else None}
+        for v in ventes
+    ]
+
+# User management (DG only)
 @app.post("/api/users/create")
 async def create_user(user: UserCreate, current_user = Depends(role_required([RoleEnum.DG])), db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email déjà utilisé")
+    
     hashed = get_password_hash(user.mot_de_passe)
     db_user = User(nom=user.nom, email=user.email, mot_de_passe=hashed, role_id=user.role)
     db.add(db_user)
     db.commit()
-    return {"message": f"Utilisateur {user.nom} créé"}
+    
+    return {"message": f"Utilisateur {user.nom} créé avec succès", "user_id": db_user.id}
+
+@app.post("/api/users/disable/{user_id}")
+async def disable_user(user_id: int, current_user = Depends(role_required([RoleEnum.DG])), db: Session = Depends(get_db)):
+    if current_user.get("user_id") == user_id:
+        raise HTTPException(status_code=400, detail="Vous ne pouvez pas vous désactiver vous-même")
+    
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Utilisateur non trouvé")
+    
+    user.is_active = False
+    db.commit()
+    
+    return {"message": f"Utilisateur {user.nom} désactivé avec succès"}
 
 @app.get("/api/users/all")
 async def get_all_users(current_user = Depends(role_required([RoleEnum.DG])), db: Session = Depends(get_db)):
     users = db.query(User).all()
-    return [{"id": u.id, "nom": u.nom, "email": u.email, "role": u.role_id} for u in users]
+    return [
+        {"id": u.id, "nom": u.nom, "email": u.email, "role": u.role_id, "active": u.is_active, "created_at": u.created_at.isoformat() if u.created_at else None}
+        for u in users
+    ]
+
+@app.get("/api/audit-logs")
+async def get_audit_logs(current_user = Depends(role_required([RoleEnum.DG])), db: Session = Depends(get_db), limit: int = 100):
+    logs = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(limit).all()
+    return [
+        {"id": log.id, "user_id": log.user_id, "action": log.action, "details": log.details, "ip_address": log.ip_address, "timestamp": log.timestamp.isoformat() if log.timestamp else None}
+        for log in logs
+    ]
+
+@app.post("/api/stock/add")
+async def add_stock(produit: str, quantite: int, current_user = Depends(role_required([RoleEnum.COMPTABLE, RoleEnum.DG])), db: Session = Depends(get_db)):
+    stock = db.query(Stock).filter(Stock.produit == produit).first()
+    if stock:
+        stock.quantite_entree += quantite
+        stock.quantite_disponible = stock.quantite_entree - stock.quantite_sortie
+    else:
+        stock = Stock(produit=produit, quantite_entree=quantite, quantite_disponible=quantite)
+        db.add(stock)
+    
+    db.commit()
+    return {"message": f"Stock mis à jour: {produit} +{quantite}"}
+
+@app.get("/api/stock/all")
+async def get_all_stocks(current_user = Depends(role_required([RoleEnum.DIRECTEUR_COMMERCIAL, RoleEnum.DG, RoleEnum.DAF])), db: Session = Depends(get_db)):
+    stocks = db.query(Stock).all()
+    return [
+        {"produit": s.produit, "quantite_entree": s.quantite_entree, "quantite_sortie": s.quantite_sortie, "quantite_disponible": s.quantite_disponible}
+        for s in stocks
+    ]
 
 if __name__ == "__main__":
     import uvicorn
