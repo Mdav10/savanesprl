@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>SavaneSPRL - Financial System</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 20px; background: #f0f0f0; }
+        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 10px; }
+        input, select, button { width: 100%; padding: 10px; margin: 5px 0; }
+        button { background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        .token { background: #e8f4f8; padding: 10px; word-break: break-all; }
+        .result { background: #f8f9fa; padding: 10px; margin-top: 10px; white-space: pre-wrap; }
+        h2 { color: #333; }
+        .logout-btn { background: #dc3545; }
+        .logout-btn:hover { background: #c82333; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🏦 SavaneSPRL Financial System</h1>
+    
+    <div id="loginSection" class="section">
+        <h2>Login</h2>
+        <input type="email" id="loginEmail" placeholder="Email" value="dg@savane.com">
+        <input type="password" id="loginPassword" placeholder="Password" value="Admin123!">
+        <button onclick="login()">Login</button>
+    </div>
+
+    <div id="appSection" style="display:none;">
+        <div class="token" id="tokenDisplay"></div>
+        <button onclick="logout()" class="logout-btn">Logout</button>
+        
+        <div class="section">
+            <h2>📊 Dashboard DG</h2>
+            <button onclick="getDashboard()">Get Dashboard</button>
+            <div id="dashboardResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>💰 Create Transaction (Comptable only)</h2>
+            <select id="transType">
+                <option value="entrée">Entrée (Income)</option>
+                <option value="sortie">Sortie (Expense - Needs Approval)</option>
+            </select>
+            <input type="number" id="montant" placeholder="Montant">
+            <input type="text" id="libelle" placeholder="Libellé">
+            <button onclick="createTransaction()">Create Transaction</button>
+            <div id="transResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>✅ Pending Approvals (DG/DAF)</h2>
+            <button onclick="getPending()">Get Pending Transactions</button>
+            <div id="pendingResult" class="result"></div>
+            <input type="number" id="approveId" placeholder="Transaction ID to approve">
+            <select id="approveAction">
+                <option value="true">Approve</option>
+                <option value="false">Reject</option>
+            </select>
+            <button onclick="approveTransaction()">Submit Approval</button>
+        </div>
+
+        <div class="section">
+            <h2>📦 Record Sale (Agent Marketing)</h2>
+            <input type="text" id="produit" placeholder="Product name">
+            <input type="number" id="quantite" placeholder="Quantity">
+            <input type="number" id="prix" placeholder="Unit price">
+            <button onclick="createVente()">Record Sale</button>
+            <div id="venteResult" class="result"></div>
+        </div>
+
+        <div class="section">
+            <h2>👥 User Management (DG only)</h2>
+            <input type="text" id="newUserName" placeholder="Full name">
+            <input type="email" id="newUserEmail" placeholder="Email">
+            <input type="password" id="newUserPass" placeholder="Password">
+            <select id="newUserRole">
+                <option value="DG">DG</option>
+                <option value="DAF">DAF</option>
+                <option value="DIRECTEUR_COMMERCIAL">Directeur Commercial</option>
+                <option value="COMPTABLE">Comptable</option>
+                <option value="AGENT_MARKETING">Agent Marketing</option>
+            </select>
+            <button onclick="createUser()">Create User</button>
+            <button onclick="listUsers()">List All Users</button>
+            <div id="userResult" class="result"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+let authToken = localStorage.getItem('token');
+let userRole = localStorage.getItem('role');
+
+const API_URL = 'https://savanesprl-api.onrender.com';
+
+// Check if already logged in
+if(authToken) {
+    document.getElementById('loginSection').style.display = 'none';
+    document.getElementById('appSection').style.display = 'block';
+    document.getElementById('tokenDisplay').innerHTML = `✅ Logged in as: ${localStorage.getItem('userEmail')} | Role: ${userRole}`;
+}
+
+async function login() {
+    const email = document.getElementById('loginEmail').value;
+    const password = document.getElementById('loginPassword').value;
+    
+    try {
+        const response = await fetch(`${API_URL}/api/auth/login`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({email, mot_de_passe: password})
+        });
+        const data = await response.json();
+        
+        if(response.ok) {
+            authToken = data.access_token;
+            userRole = data.role;
+            localStorage.setItem('token', authToken);
+            localStorage.setItem('role', userRole);
+            localStorage.setItem('userEmail', email);
+            
+            document.getElementById('loginSection').style.display = 'none';
+            document.getElementById('appSection').style.display = 'block';
+            document.getElementById('tokenDisplay').innerHTML = `✅ Logged in as: ${email} | Role: ${userRole}`;
+            alert('Login successful!');
+        } else {
+            alert('Login failed: ' + JSON.stringify(data));
+        }
+    } catch(error) {
+        alert('Error: ' + error.message);
+    }
+}
+
+function logout() {
+    localStorage.clear();
+    authToken = null;
+    document.getElementById('loginSection').style.display = 'block';
+    document.getElementById('appSection').style.display = 'none';
+    location.reload();
+}
+
+async function getDashboard() {
+    const response = await fetch(`${API_URL}/api/dashboard/dg`, {
+        headers: {'Authorization': `Bearer ${authToken}`}
+    });
+    const data = await response.json();
+    document.getElementById('dashboardResult').innerHTML = JSON.stringify(data, null, 2);
+}
+
+async function createTransaction() {
+    const type = document.getElementById('transType').value;
+    const montant = document.getElementById('montant').value;
+    const libelle = document.getElementById('libelle').value;
+    
+    const response = await fetch(`${API_URL}/api/transactions`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`
+        },
+        body: JSON.stringify({type, montant: parseFloat(montant), libelle})
+    });
+    const data = await response.json();
+    document.getElementById('transResult').innerHTML = JSON.stringify(data, null, 2);
+}
+
+async function getPending() {
+    const response = await fetch(`${API_URL}/api/transactions/pending`, {
+        headers: {'Authorization': `Bearer ${authToken}`}
+    });
+    const data = await response.json();
+    document.getElementById('pendingResult').innerHTML = JSON.stringify(data, null, 2);
+}
+
+async function approveTransaction() {
+    const id = document.getElementById('approveId').value;
+    const approuver = document.getElementById('approveAction').value === 'true';
+    
+    const response = await fetch(`${API_URL}/api/transactions/approve`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`
+        },
+        body: JSON.stringify({transaction_id: parseInt(id), approuver})
+    });
+    const data = await response.json();
+    alert(JSON.stringify(data));
+    getPending();
+}
+
+async function createVente() {
+    const produit = document.getElementById('produit').value;
+    const quantite = document.getElementById('quantite').value;
+    const prix_unitaire = document.getElementById('prix').value;
+    
+    const response = await fetch(`${API_URL}/api/ventes`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`
+        },
+        body: JSON.stringify({produit, quantite: parseInt(quantite), prix_unitaire: parseFloat(prix_unitaire)})
+    });
+    const data = await response.json();
+    document.getElementById('venteResult').innerHTML = JSON.stringify(data, null, 2);
+}
+
+async function createUser() {
+    const nom = document.getElementById('newUserName').value;
+    const email = document.getElementById('newUserEmail').value;
+    const mot_de_passe = document.getElementById('newUserPass').value;
+    const role = document.getElementById('newUserRole').value;
+    
+    const response = await fetch(`${API_URL}/api/users/create`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${authToken}`
+        },
+        body: JSON.stringify({nom, email, mot_de_passe, role})
+    });
+    const data = await response.json();
+    document.getElementById('userResult').innerHTML = JSON.stringify(data, null, 2);
+}
+
+async function listUsers() {
+    const response = await fetch(`${API_URL}/api/users/all`, {
+        headers: {'Authorization': `Bearer ${authToken}`}
+    });
+    const data = await response.json();
+    document.getElementById('userResult').innerHTML = JSON.stringify(data, null, 2);
+}
+</script>
+</body>
+</html>
